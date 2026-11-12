@@ -147,16 +147,42 @@ def iter_closure_windows(
     scan_start = max(effective_start, travel_enter.date() - timedelta(days=1))
     scan_end = travel_exit.date()
 
+    yield from iter_date_range_windows(
+        effective_start=effective_start,
+        effective_end=effective_end,
+        weekdays=weekdays,
+        clock=clock,
+        range_start=scan_start,
+        range_end=scan_end,
+    )
+
+
+def iter_date_range_windows(
+    *,
+    effective_start: date,
+    effective_end: Optional[date],
+    weekdays: list[int],
+    clock: ClockRange,
+    range_start: date,
+    range_end: date,
+) -> Iterator[tuple[datetime, datetime]]:
+    """枚举开始日落在北京时间日期范围 [range_start, range_end] 内的封闭窗口。
+
+    双源对账按“日期范围”而非通行区间展开，规则与 iter_closure_windows 完全
+    一致：封闭日命中每周封闭日、开始日落在生效日期区间内；跨午夜窗口的结束
+    时刻落在次日，但窗口归属（及日期范围归属）仍按开始日计算。
+    """
+    scan_start = max(effective_start, range_start)
+    scan_end = range_end if effective_end is None else min(range_end, effective_end)
+
     d = scan_start
     weekday_set = set(weekdays)
     while d <= scan_end:
-        if d.weekday() in weekday_set and d >= effective_start:
-            if effective_end is None or d <= effective_end:
-                start_dt = datetime.combine(d, clock.start, BEIJING_TZ)
-                end_day = d + timedelta(days=1) if clock.cross_midnight else d
-                end_dt = datetime.combine(end_day, clock.end, BEIJING_TZ)
-                if is_intersecting(travel_enter, travel_exit, start_dt, end_dt):
-                    yield start_dt, end_dt
+        if d.weekday() in weekday_set:
+            start_dt = datetime.combine(d, clock.start, BEIJING_TZ)
+            end_day = d + timedelta(days=1) if clock.cross_midnight else d
+            end_dt = datetime.combine(end_day, clock.end, BEIJING_TZ)
+            yield start_dt, end_dt
         d += timedelta(days=1)
 
 

@@ -11,6 +11,11 @@
 5. 任何页面抓取失败时标记 `undetermined`（无法判定）并给出失败地址，
    **绝不会在信息不完整时报“全程畅通”**。
 
+此外提供 **`POST /reconcile` 双源对账 API**：传入交管部门与承运商两份公告
+目录 URL 和**最多七天的北京时间日期范围**，分别完整采集两个来源后，按
+路段与方向找出仅一侧刊载的封闭时段（含实际覆盖该时段的公告链接），避免
+排车时漏看封闭。
+
 ## 时间规则（需求约定）
 
 - 公告中的所有时间一律按**北京时间（UTC+8）**解释；请求中的时间可带任意
@@ -28,18 +33,90 @@
 ```
 .
 ├── app/                  # FastAPI 采集与核对服务
-│   ├── main.py           # 路由：GET /health、POST /check
-│   ├── models.py         # 请求/响应模型（时间必须带时区）
+│   ├── main.py           # 路由：GET /health、POST /check、POST /reconcile
+│   ├── models.py         # 请求/响应模型（时间必须带时区，日期范围 ≤7 天）
 │   ├── parser.py         # BeautifulSoup 列表分页与详情解析
 │   ├── scraper.py        # httpx 异步抓取、重试、失败记录
-│   ├── scheduler.py      # 路段匹配与区间相交判定
+│   ├── scheduler.py      # 路段匹配与区间相交判定（/check）
+│   ├── reconciler.py     # 双源对账：展开、来源内合并、求两侧差异（/reconcile）
+│   ├── intervals.py      # 半开区间合并（重叠/相邻）与区间相减
 │   └── timeutils.py      # 北京时间、跨午夜、生效期、星期解析
-├── sample-site/          # 离线样本站（Flask，同构分页+详情，含一个失效链接）
-├── tests/smoke_test.py   # 端到端冒烟测试（仅标准库）
+├── sample-site/          # 离线样本站（Flask，同构分页+详情，含失效链接）
+├── tests/
+│   ├── smoke_test.py            # /check 端到端冒烟测试（仅标准库）
+│   ├── test_reconcile.py        # 区间运算与对账规则单元测试
+│   └── reconcile_smoke_test.py  # /reconcile 端到端冒烟测试（仅标准库）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
 ```
+
+## 双源对账 `POST /reconcile`
+
+### 请求
+
+| 字段 | 含义 |
+| --- | --- |
+| `source_a_list_url` | 来源 A（如交管部门）公告目录列表页 URL |
+| `source_b_list_url` | 来源 B（如承运商）公告目录列表页 URL（不能与 A 相同） |
+| `start_date` / `end_date` | 北京时间日期范围（含首尾，**跨度最多 7 天**） |
+
+两个来源**各自完整采集**（分页 + 全部详情逐条尝试，互不短路）。封闭时段
+按原有封闭日、**跨午夜归属开始当天**、生效日期限定与**双向通行**规则展开，
+仅取开始日落在日期范围内的窗口；每个来源内部先合并重叠/首尾相接的区间，
+再按 `路段编号 + 方向` 做区间相减。
+
+### 响应与判定规则
+
+| 字段 | 含义 |
+| --- | --- |
+| `status` | `consistent` 两侧完整且时段完全一致；`different` 两侧完整但存在单侧封闭；`partial` 至少一侧采集不完整 |
+| `confirmed_differences[]` | **可确认**的单侧封闭：对侧来源已完整采集，足以判定对侧漏载 |
+| `pending_differences[]` | **待核实**的单侧封闭：对侧来源采集不完整，不能断言漏载 |
+| `source_a` / `source_b` | 各来源的列表 URL、`complete`、成功解析公告数与失败地址 |
+| 差异内 `announcements` | **实际覆盖该差异时段**的公告详情链接（逐段核对，去重） |
+
+关键约束（需求约定）：
+
+- **判定某一来源漏载前，必须先完整采集该来源**。例如 A 有某时段而 B 没有，
+  只有 B 完整时才记为 `confirmed`（B 漏载）；B 采集不完整时同样的时段只能
+  标 `pending`（待核实），并在 `source_b.failures` 列出失败地址。
+- 任一侧采集不完整时，保留仍可确认的差异，**绝不报告两侧一致**
+  （不会出现 `consistent`）。
+- 公告方向为“双向”时，差异按“上行/下行”两个方向分别给出。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_a_list_url": "http://sample-site:8080/traffic/announcements?page=1",
+    "source_b_list_url": "http://sample-site:8080/carrier/announcements?page=1",
+    "start_date": "2026-11-16",
+    "end_date": "2026-11-22"
+  }'
+```
+
+### 离线样本目录
+
+样本站在同一容器内提供三份同构目录，均带同站分页：
+
+| 目录前缀 | 角色 | 特点 |
+| --- | --- | --- |
+| `/traffic` | 交管部门（来源 A） | 3 条公告，采集完整、无失效链接 |
+| `/carrier` | 承运商（来源 B） | 4 条公告，与交管存在刊载差异，含 1 个失效详情链接（404） |
+| `/carrier-full` | 承运商完整镜像 | 与 `/carrier` 同数据但无失效链接，用于验证两侧完整时的 `different` |
+| `/announcements`（无前缀） | 旧版单目录 | 供 `/check` 冒烟测试，含 1 个失效链接 |
+
+内置的刊载差异（2026-11-16 ~ 2026-11-22 窗口内）：
+
+- `G15-K123 下行`：交管每周一、三夜间 `22:00-次日05:00`，承运商仅周一
+  → 周三（11-18）夜间为交管独有；
+- `G25-K88 双向`：交管周六、周日全天，承运商仅周日
+  → 周六（11-21）全天为交管独有，按上行/下行各一条；
+- `G60-K45 上行`：仅承运商刊载周五（11-20）`08:00-12:00`；
+- `G15-K123 上行`：两侧完全一致，对账结果中不出现。
 
 ## 用 Docker Compose 启动（离线可用）
 
@@ -100,7 +177,9 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt -r sample-site/requirements.txt
 python sample-site/app.py &
 uvicorn app.main:app --port 8000
-python tests/smoke_test.py
+python tests/smoke_test.py             # /check 端到端
+python tests/reconcile_smoke_test.py   # /reconcile 端到端
+python -m unittest tests.test_reconcile -v   # 对账规则单元测试
 ```
 
 ## 解析约定
